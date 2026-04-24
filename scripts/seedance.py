@@ -3,24 +3,22 @@
 Seedance 视频生成 CLI（Volcengine Ark API）
 用法见本 skill 的 SKILL.md「API 生成」一节。
 
-  python3 seedance.py create --prompt "描述" [options]
-  python3 seedance.py create --prompt "描述" --image img.jpg [options]
-  python3 seedance.py create --prompt "描述" --image first.jpg --last-frame last.jpg [options]
-  python3 seedance.py create --prompt "描述" --ref-images ref1.jpg ref2.jpg [options]
-  python3 seedance.py create --prompt "描述" --video motion_ref.mp4 [options]
-  python3 seedance.py create --prompt "描述" --audio bgm.mp3 [options]
-  python3 seedance.py create --draft-task-id <task_id> [options]
-  python3 seedance.py status <task_id>
-  python3 seedance.py wait <task_id> [--interval 15] [--download DIR]
-  python3 seedance.py list [--status succeeded] [--page 1] [--page-size 10]
-  python3 seedance.py delete <task_id>
+快速上手：
+  python3 scripts/seedance.py create --prompt "描述" --duration 5 --wait
+  python3 scripts/seedance.py create --image img.jpg --prompt "描述" --duration 5 --wait
+  python3 scripts/seedance.py create --image img.jpg --video-ref video.mp4 --prompt "角色替换" --duration 5 --wait
+
+视频参考（运动复刻/角色替换）：
+  python3 scripts/seedance.py create --video-ref ref.mp4 --image char.png --prompt "替换" --wait
 """
 
 import argparse
 import base64
+import hashlib
 import json
 import mimetypes
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -30,6 +28,11 @@ from pathlib import Path
 
 BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
 DEFAULT_MODEL = "doubao-seedance-2-0-fast-260128"
+
+# nginx 图床配置
+NGINX_VIDEO_HOST = "img.aistar.work"
+NGINX_VIDEO_PATH = "/www/video/"
+NGINX_CONTAINER = "1Panel-openresty-kfra"
 
 
 def get_api_key():
@@ -41,7 +44,96 @@ def get_api_key():
     return key
 
 
-def api_request(method, url, data=None):
+NGINX_VIDEO_HOST = "img.aistar.work"
+NGINX_VIDEO_PATH = "/www/video/"
+NGINX_CONTAINER = "1Panel-openresty-kfra"
+
+
+def get_video_public_url(local_video_path):
+    """
+    将本地视频文件上传到 nginx 静态托管，返回公网 HTTPS URL。
+
+    流程：
+      1. 计算文件 MD5 生成唯一文件名（避免冲突）
+      2. 复制到容器内 /www/video/
+      3. 通过 img.aistar.work/video/<filename> 暴露公网
+
+    失败时打印操作指引（不直接退出，留给用户选择）。
+    """
+    p = Path(local_video_path)
+    if not p.exists():
+        print(f"Error: Video file not found: {local_video_path}", file=sys.stderr)
+        sys.exit(1)
+
+    file_size = p.stat().st_size
+    if file_size > 50 * 1024 * 1024:
+        print(f"Error: Video file too large ({file_size / 1024 / 1024:.1f} MB). Max 50 MB.", file=sys.stderr)
+        sys.exit(1)
+
+    # 生成唯一文件名：MD5 + 原扩展名
+    md5_hash = hashlib.md5(p.read_bytes()).hexdigest()[:12]
+    safe_name = f"{md5_hash}_{p.name}"
+    container_dest = f"/www/video/{safe_name}"
+
+    # 复制到容器
+    print(f"  Uploading to nginx static host ({NGINX_CONTAINER}:{container_dest})...", end=" ", flush=True)
+    try:
+        subprocess.run(
+            ["docker", "exec", NGINX_CONTAINER, "mkdir", "-p", "/www/video/"],
+            check=True, capture_output=True
+        )
+        subprocess.run(
+            ["docker", "cp", str(p.absolute()), f"{NGINX_CONTAINER}:{container_dest}"],
+            check=True, capture_output=True
+        )
+        subprocess.run(
+            ["docker", "exec", NGINX_CONTAINER, "chmod", "644", container_dest],
+            check=True, capture_output=True
+        )
+    except FileNotFoundError:
+        print(f"\nError: docker command not found. Is Docker installed?", file=sys.stderr)
+        print(f"Hint: Install Docker or manually upload your video to a public HTTPS URL", file=sys.stderr)
+        print(f"      and pass it directly: --video-ref https://your-domain.com/video.mp4", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+        # 容器不存在可能是改名了，尝试检测
+        if "No such container" in stderr or "Cannot connect" in stderr:
+            print(f"\nError: Container '{NGINX_CONTAINER}' not found.", file=sys.stderr)
+            print(f"Hint: Check your nginx container name with: docker ps", file=sys.stderr)
+            print(f"      Or upload video manually and pass public URL: --video-ref https://...", file=sys.stderr)
+        else:
+            print(f"\nError: docker exec failed: {stderr}", file=sys.stderr)
+            print(f"Hint: Try uploading video to a public URL manually:", file=sys.stderr)
+            print(f"      --video-ref https://your-domain.com/video.mp4", file=sys.stderr)
+        sys.exit(1)
+
+    public_url = f"https://{NGINX_VIDEO_HOST}/video/{safe_name}"
+    print(f"✓")
+
+    # 可选验证（警告级别，不阻断）
+    if not verify_url_accessible(public_url, timeout=15):
+        print(f"  Warning: Video URL may not be publicly accessible yet.", file=sys.stderr)
+        print(f"  If the API fails, check: is cloudflared tunnel running? (journalctl --user -u cloudflared)", file=sys.stderr)
+        print(f"  Or use a direct public URL: --video-ref https://your-domain.com/video.mp4", file=sys.stderr)
+
+    return public_url
+
+
+def verify_url_accessible(url, timeout=10):
+    """验证 URL 是否可访问（HEAD 请求）。"""
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        req.add_header("User-Agent", "Mozilla/5.0")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def api_request(method, url, data=None, timeout=120):
     """Make an API request and return parsed JSON response."""
     api_key = get_api_key()
     headers = {
@@ -53,7 +145,7 @@ def api_request(method, url, data=None):
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             resp_body = resp.read().decode("utf-8")
             if resp_body:
                 return json.loads(resp_body)
@@ -83,7 +175,7 @@ def image_to_data_url(image_path):
     mime_map = {
         "jpg": "jpeg", "jpeg": "jpeg", "png": "png",
         "webp": "webp", "bmp": "bmp", "tiff": "tiff",
-        "tif": "tiff", "gif": "gif", "heic": "heic", "heif": "heif",
+        "gif": "gif", "heic": "heic", "heif": "heif",
     }
     mime_ext = mime_map.get(ext, ext)
 
@@ -132,11 +224,23 @@ def file_to_data_url(file_path, media_type):
     return f"data:{mime};base64,{b64}"
 
 
-def resolve_media(media_input, media_type):
-    """Resolve media input (video/audio) to URL or data URL."""
-    if media_input.startswith(("http://", "https://", "data:")):
-        return media_input
-    return file_to_data_url(media_input, media_type)
+def resolve_video_url(video_input):
+    """
+    Resolve video input to a public HTTPS URL.
+    
+    - HTTP/HTTPS URL → 直接返回
+    - 本地文件 → 上传到 nginx 静态托管 → 返回公网 URL
+    - data: URL → 不支持（API 不接受）
+    """
+    if video_input.startswith(("http://", "https://")):
+        return video_input
+    elif video_input.startswith("data:"):
+        print("Error: base64 data: URLs are not supported for video input.", file=sys.stderr)
+        print("Hint: Use a local file path and the script will auto-upload to nginx.", file=sys.stderr)
+        sys.exit(1)
+    else:
+        # 本地文件 → 上传到 nginx
+        return get_video_public_url(video_input)
 
 
 def cmd_create(args):
@@ -172,22 +276,27 @@ def cmd_create(args):
                     "role": "last_frame"
                 })
 
-        if args.video:
-            for v in args.video:
+        # 视频参考（本地文件自动上传 nginx，URL 直接使用）
+        if args.video_ref:
+            for v in args.video_ref:
+                video_url = resolve_video_url(v)
                 content.append({
                     "type": "video_url",
-                    "video_url": {"url": resolve_media(v, "video")}
+                    "video_url": {"url": video_url},
+                    "role": "reference_video"
                 })
 
+        # 音频参考
         if args.audio:
             for a in args.audio:
+                audio_url = resolve_audio_url(a)
                 content.append({
                     "type": "audio_url",
-                    "audio_url": {"url": resolve_media(a, "audio")}
+                    "audio_url": {"url": audio_url}
                 })
 
     if not content:
-        print("Error: Must provide --prompt, --image, --video, --audio, or --draft-task-id.", file=sys.stderr)
+        print("Error: Must provide --prompt, --image, --video-ref, --audio, or --draft-task-id.", file=sys.stderr)
         sys.exit(1)
 
     body = {
@@ -222,7 +331,8 @@ def cmd_create(args):
     if getattr(args, 'callback_url', None):
         body["callback_url"] = args.callback_url
 
-    result = api_request("POST", BASE_URL, body)
+    print(f"Creating task with model {args.model}...")
+    result = api_request("POST", BASE_URL, body, timeout=120)
     task_id = result.get("id", "")
 
     print(json.dumps({"task_id": task_id, "status": "created", "response": result}, indent=2))
@@ -231,6 +341,13 @@ def cmd_create(args):
         return cmd_wait_logic(task_id, args.interval or 15, args.download)
 
     return task_id
+
+
+def resolve_audio_url(audio_input):
+    """Resolve audio input to URL or data URL."""
+    if audio_input.startswith(("http://", "https://", "data:")):
+        return audio_input
+    return file_to_data_url(audio_input, "audio")
 
 
 def cmd_status(args):
@@ -244,7 +361,7 @@ def cmd_status(args):
 def cmd_wait_logic(task_id, interval=15, download_dir=None):
     """Wait for task completion, optionally download result."""
     url = f"{BASE_URL}/{task_id}"
-    print(f"Waiting for task {task_id} to complete (polling every {interval}s)...")
+    print(f"Waiting for task {task_id} (polling every {interval}s)...")
 
     while True:
         result = api_request("GET", url)
@@ -257,7 +374,7 @@ def cmd_wait_logic(task_id, interval=15, download_dir=None):
             resolution = result.get("resolution", "?")
             ratio = result.get("ratio", "?")
 
-            print(f"\nVideo generation succeeded!")
+            print(f"\n✅ Succeeded!")
             print(f"  Duration: {duration}s | Resolution: {resolution} | Ratio: {ratio}")
             print(f"  Video URL: {video_url}")
             if last_frame_url:
@@ -269,11 +386,10 @@ def cmd_wait_logic(task_id, interval=15, download_dir=None):
                 filename = f"seedance_{task_id}_{int(time.time())}.mp4"
                 filepath = download_path / filename
 
-                print(f"\nDownloading video to {filepath}...")
+                print(f"\nDownloading to {filepath}...")
                 try:
                     urllib.request.urlretrieve(video_url, str(filepath))
-                    print(f"Saved to: {filepath}")
-
+                    print(f"✅ Saved: {filepath}")
                     if sys.platform == "darwin":
                         os.system(f'open "{filepath}"')
                 except Exception as e:
@@ -284,13 +400,13 @@ def cmd_wait_logic(task_id, interval=15, download_dir=None):
 
         elif status == "failed":
             error = result.get("error", {})
-            print(f"\nVideo generation failed!")
+            print(f"\n❌ Failed!")
             print(f"  Error: {error.get('code', 'unknown')} - {error.get('message', 'Unknown error')}")
             print(json.dumps(result, indent=2, ensure_ascii=False))
             sys.exit(1)
 
         elif status == "expired":
-            print(f"\nVideo generation task expired.")
+            print(f"\n⏰ Task expired.")
             print(json.dumps(result, indent=2, ensure_ascii=False))
             sys.exit(1)
 
@@ -327,7 +443,7 @@ def cmd_delete(args):
     """Cancel or delete a task."""
     url = f"{BASE_URL}/{args.task_id}"
     api_request("DELETE", url)
-    print(f"Task {args.task_id} cancelled/deleted successfully.")
+    print(f"Task {args.task_id} cancelled/deleted.")
 
 
 def parse_bool(v):
@@ -341,16 +457,36 @@ def parse_bool(v):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Seedance Video Generation CLI (Volcengine Ark)")
+    parser = argparse.ArgumentParser(
+        description="Seedance Video Generation CLI (Volcengine Ark API)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # 纯文本生成
+  python3 seedance.py create -p "宇航员在太空行走" --duration 5 --wait
+
+  # 图生视频（首帧）
+  python3 seedance.py create -i hero.png -p "英雄转身" --ratio adaptive --wait
+
+  # 视频参考 / 角色替换（本地视频自动上传 nginx）
+  python3 seedance.py create --video-ref motion.mp4 --image char.png -p "替换角色" --wait
+
+  # 多模态混合
+  python3 seedance.py create -i scene.jpg --video-ref ref.mp4 -p "动作复刻" --wait
+
+  # 等待结果并下载
+  python3 seedance.py create -p "描述" --duration 5 --wait --download ~/Desktop
+        """
+    )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     p_create = subparsers.add_parser("create", help="Create a video generation task")
     p_create.add_argument("--prompt", "-p", help="Text prompt describing the video")
     p_create.add_argument("--image", "-i", help="First frame image (URL or local file path)")
     p_create.add_argument("--last-frame", help="Last frame image (URL or local file path)")
-    p_create.add_argument("--ref-images", nargs="+", help="Reference images (1-9 URLs or paths)")
-    p_create.add_argument("--video", nargs="+", help="Reference videos (URL or local file, max 3, Seedance 2.0)")
-    p_create.add_argument("--audio", nargs="+", help="Reference audio (URL or local file, max 3, Seedance 2.0)")
+    p_create.add_argument("--ref-images", nargs="+", help="Reference images (URLs or paths, role=reference_image)")
+    p_create.add_argument("--video-ref", nargs="+", help="Reference video (local path or URL, role=reference_video, local files auto-uploaded to nginx)")
+    p_create.add_argument("--audio", nargs="+", help="Reference audio (URL or local file path)")
     p_create.add_argument("--draft-task-id", help="Draft task ID to generate final video from")
     p_create.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"Model ID (default: {DEFAULT_MODEL})")
     p_create.add_argument("--ratio", choices=["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"], help="Aspect ratio")
@@ -362,10 +498,10 @@ def main():
     p_create.add_argument("--generate-audio", type=parse_bool, help="Generate audio (true/false)")
     p_create.add_argument("--draft", type=parse_bool, help="Draft/preview mode (true/false, 1.5 Pro)")
     p_create.add_argument("--return-last-frame", type=parse_bool, help="Return last frame URL (true/false)")
-    p_create.add_argument("--service-tier", choices=["default", "flex"], help="Service tier (flex = offline, 50%% cheaper)")
-    p_create.add_argument("--frames", type=int, help="Exact frame count (25+4n, range 29-289, 1.0 models only)")
+    p_create.add_argument("--service-tier", choices=["default", "flex"], help="Service tier (flex=offline, 50%% cheaper)")
+    p_create.add_argument("--frames", type=int, help="Exact frame count (25+4n, 29-289, 1.0 models only)")
     p_create.add_argument("--execution-expires-after", type=int, help="Task timeout in seconds (3600-259200)")
-    p_create.add_argument("--callback-url", help="Webhook URL for task status notifications")
+    p_create.add_argument("--callback-url", help="Webhook URL for task notifications")
     p_create.add_argument("--wait", "-w", action="store_true", help="Wait for completion after creating")
     p_create.add_argument("--interval", type=int, default=15, help="Poll interval in seconds (default: 15)")
     p_create.add_argument("--download", help="Download directory (e.g. ~/Desktop)")
