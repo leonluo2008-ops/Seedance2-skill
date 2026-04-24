@@ -168,7 +168,8 @@ img.aistar.work 已预配置静态视频路径，无需手动修改：
 ### 前置
 
 ```bash
-export ARK_API_KEY="your-api-key-here"
+# 写入 ~/.bashrc 以便持久化（只需一次）
+echo 'export ARK_API_KEY="your-api-key-here"' >> ~/.bashrc && source ~/.bashrc
 ```
 
 ### 用法
