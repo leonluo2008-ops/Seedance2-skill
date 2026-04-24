@@ -29,7 +29,7 @@ from pathlib import Path
 
 
 BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
-DEFAULT_MODEL = "doubao-seedance-2-0-260128"
+DEFAULT_MODEL = "doubao-seedance-2-0-fast-260128"
 
 
 def get_api_key():
