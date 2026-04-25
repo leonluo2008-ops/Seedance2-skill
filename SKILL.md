@@ -153,7 +153,7 @@ img.aistar.work 已预配置静态视频路径，无需手动修改：
 
 ## API 生成
 
-> 脚本默认使用 **Seedance 2.0 Fast**（`doubao-seedance-2-0-fast-260128`）。如果 2.0 API 尚未开放或遇到模型不可用错误，加 `--model doubao-seedance-1-5-pro-251215` 回退到 1.5 Pro。
+> 脚本默认使用 **Seedance 2.0 Fast**（`doubao-seedance-2-0-fast-260128`）。如需使用 Seedance 2.0 非 Fast 版（质量优先），加 `--model doubao-seedance-2-0-260128`。如果 2.0 API 不可用，加 `--model doubao-seedance-1-5-pro-251215` 回退到 1.5 Pro。
 
 ### 模型
 
